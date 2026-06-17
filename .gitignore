@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data
+data/*.csv
+
+# Personal notes
+docs/curr.md
+
+# Streamlit
+.streamlit/
+
+# VS Code
+.vscode/
