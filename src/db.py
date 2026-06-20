@@ -138,3 +138,68 @@ def get_total_violations():
 
 def get_total_clusters():
     return int(query("SELECT COUNT(*) AS n FROM persistent_hotspots").iloc[0, 0])
+
+
+# ── OSM Enrichment Cache (Objective 2) ────────────────────────────────────────
+
+ENRICHMENT_COLUMNS = [
+    "cell_key", "centroid_lat", "centroid_long",
+    "road_type", "lane_count", "maxspeed", "is_oneway",
+    "road_importance_score", "road_segment_length",
+    "office_count", "hospital_count", "school_count", "college_count",
+    "university_count", "bus_stop_count", "railway_station_count",
+    "parking_lot_count", "mall_count", "market_count", "religious_place_count",
+    "fetched_at",
+]
+
+
+def ensure_enrichment_table():
+    with _conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS hotspot_enrichment (
+                cell_key              TEXT PRIMARY KEY,
+                centroid_lat          REAL,
+                centroid_long         REAL,
+                road_type             TEXT,
+                lane_count            INTEGER,
+                maxspeed              TEXT,
+                is_oneway             INTEGER,
+                road_importance_score REAL,
+                road_segment_length   REAL,
+                office_count          INTEGER,
+                hospital_count        INTEGER,
+                school_count          INTEGER,
+                college_count         INTEGER,
+                university_count      INTEGER,
+                bus_stop_count        INTEGER,
+                railway_station_count INTEGER,
+                parking_lot_count     INTEGER,
+                mall_count            INTEGER,
+                market_count          INTEGER,
+                religious_place_count INTEGER,
+                fetched_at            TEXT
+            )
+        """)
+        conn.commit()
+
+
+def get_enrichment(cell_keys):
+    if not cell_keys:
+        return pd.DataFrame(columns=ENRICHMENT_COLUMNS)
+    placeholders = ",".join("?" for _ in cell_keys)
+    return query(
+        f"SELECT * FROM hotspot_enrichment WHERE cell_key IN ({placeholders})",
+        tuple(cell_keys),
+    )
+
+
+def upsert_enrichment(row):
+    vals = [row.get(c) for c in ENRICHMENT_COLUMNS]
+    placeholders = ",".join("?" for _ in ENRICHMENT_COLUMNS)
+    cols = ",".join(ENRICHMENT_COLUMNS)
+    with _conn() as conn:
+        conn.execute(
+            f"INSERT OR REPLACE INTO hotspot_enrichment ({cols}) VALUES ({placeholders})",
+            vals,
+        )
+        conn.commit()

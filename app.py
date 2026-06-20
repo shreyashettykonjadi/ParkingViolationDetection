@@ -17,6 +17,7 @@ if not Path(DB_PATH).exists():
     st.stop()
 
 from src import db
+from src import enrichment
 
 MONTH_LABEL   = db.MONTH_LABELS
 SHIFT_DISPLAY = db.SHIFT_DISPLAY
@@ -204,27 +205,45 @@ with tab4:
         elif hour < 20: return "evening_peak"
         else:           return "late_night"
 
-    auto_bucket  = _hour_to_bucket(auto_hour)
-    auto_context = f"{auto_day_type}_{auto_bucket}"
+    auto_bucket = _hour_to_bucket(auto_hour)
 
-    st.info(
-        f"🕐 Current IST: **{now.strftime('%H:%M')}** on **{now.strftime('%A')}** "
-        f"→ Context: `{auto_context}`"
-    )
+    DAY_TYPES   = ["weekday", "weekend"]
+    ALL_BUCKETS = list(SHIFT_DISPLAY.keys())
 
-    use_override = st.checkbox("Override time (for demo)")
-    if use_override:
-        col_a, col_b = st.columns(2)
+    # Live toggle — ON locks selectors to current IST context
+    live_mode = st.toggle("🔴 Live", value=True,
+                          help="ON = follow current IST time. OFF = pick any of the 10 contexts manually.")
+
+    col_a, col_b = st.columns(2)
+
+    if live_mode:
+        st.info(
+            f"🕐 Current IST: **{now.strftime('%H:%M')}** on **{now.strftime('%A')}** "
+            f"→ **{auto_day_type} / {SHIFT_DISPLAY[auto_bucket]}**"
+        )
         with col_a:
-            ov_day = st.selectbox("Day Type", ["weekday", "weekend"])
+            st.selectbox("Day Type", DAY_TYPES,
+                         index=DAY_TYPES.index(auto_day_type), disabled=True, key="live_day")
         with col_b:
-            ov_bucket = st.selectbox("Time Bucket", list(SHIFT_DISPLAY.keys()),
-                                      format_func=lambda k: SHIFT_DISPLAY[k])
-        context = f"{ov_day}_{ov_bucket}"
+            st.selectbox("Time Bucket", ALL_BUCKETS,
+                         index=ALL_BUCKETS.index(auto_bucket),
+                         format_func=lambda k: SHIFT_DISPLAY[k],
+                         disabled=True, key="live_bucket")
+        sel_day    = auto_day_type
+        sel_bucket = auto_bucket
     else:
-        context = auto_context
+        with col_a:
+            sel_day = st.selectbox("Day Type", DAY_TYPES,
+                                   index=DAY_TYPES.index(auto_day_type), key="manual_day")
+        with col_b:
+            sel_bucket = st.selectbox("Time Bucket", ALL_BUCKETS,
+                                      index=ALL_BUCKETS.index(auto_bucket),
+                                      format_func=lambda k: SHIFT_DISPLAY[k],
+                                      key="manual_bucket")
 
-    st.subheader(f"Active Context: `{context}`")
+    context = f"{sel_day}_{sel_bucket}"
+
+    st.subheader(f"Active Context: `{context}` — {SHIFT_DISPLAY[sel_bucket]} {'(Weekday)' if sel_day == 'weekday' else '(Weekend)'}")
 
     rows = db.get_contextual_hotspots(context, limit=20)
 
@@ -266,3 +285,78 @@ with tab4:
         "Top Violation", "Peak Hour"
     ]
     st.dataframe(display, use_container_width=True, hide_index=True)
+
+    # ── Traffic Impact Re-Ranking (OSM-enriched) — Objective 2 ──────────────────
+    st.divider()
+    st.subheader("🚦 Traffic Impact Re-Ranking (OSM-enriched)")
+    st.caption(
+        "Re-ranks the same zones by **traffic impact** — road criticality + urban "
+        "context (hospitals, offices, schools, transit) on top of violation volume. "
+        "Live congestion (TomTom) reserved for the next phase."
+    )
+
+    if st.button("🔍 Compute Traffic Impact Scores (OSM)", key="enrich_btn"):
+        db.ensure_enrichment_table()
+        prog = st.progress(0.0, text="Querying OpenStreetMap…")
+        enriched_rows = []
+        n = len(rows)
+        for i, (_, r) in enumerate(rows.iterrows()):
+            key = enrichment.cell_key(r["centroid_lat"], r["centroid_long"])
+            cached = db.get_enrichment([key])
+            if len(cached) == 0:
+                feat = enrichment.enrich_centroid(r["centroid_lat"], r["centroid_long"])
+                feat["cell_key"] = key
+                db.upsert_enrichment(feat)
+                cached = db.get_enrichment([key])
+            enriched_rows.append(cached.iloc[0])
+            prog.progress((i + 1) / n, text=f"Enriched {i + 1}/{n} zones")
+        prog.empty()
+        st.session_state[f"impact_{context}"] = enrichment.compute_impact(
+            rows, pd.DataFrame(enriched_rows)
+        )
+
+    if f"impact_{context}" in st.session_state:
+        imp = st.session_state[f"impact_{context}"]
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Avg Impact Score", f"{imp['importance'].mean():.1f}")
+        k2.metric("Top Impact Zone", f"{imp.iloc[0]['importance']:.0f}/100")
+        moved = int((imp["rank_change"] != 0).sum())
+        k3.metric("Zones Re-Ranked", moved)
+
+        st.caption("🗺️ Sized by Traffic Impact Score | greener = higher impact")
+
+        def impact_popup(row):
+            return (
+                f"<b>🚦 Impact #{int(row['new_rank'])} — {row['zone']}</b><br>"
+                f"Impact score: {row['importance']:.1f}/100<br>"
+                f"Was enforcement priority: #{int(row['context_rank'])}<br>"
+                f"Road: {row['road_type'] or '—'} ({int(row['lane_count']) if pd.notna(row['lane_count']) else '?'} lanes)<br>"
+                f"Hospitals: {int(row['hospital_count'])} | Offices: {int(row['office_count'])} | "
+                f"Transit: {int(row['railway_station_count'])}<br>"
+                f"Why: {row['reason']}"
+            )
+
+        m_imp = make_map(imp, "importance", "green", impact_popup)
+        st_folium(m_imp, width=1200, height=550)
+
+        def arrow(c):
+            return f"▲ {c}" if c > 0 else (f"▼ {abs(c)}" if c < 0 else "—")
+
+        out = imp.copy()
+        out["Δ Rank"] = out["rank_change"].apply(arrow)
+        show = out[[
+            "new_rank", "context_rank", "Δ Rank", "zone",
+            "road_type", "lane_count", "hospital_count", "office_count",
+            "railway_station_count", "road_criticality", "urban_activity",
+            "live_congestion", "importance", "reason",
+        ]].copy()
+        show.columns = [
+            "Impact Rank", "Old Priority", "Δ Rank", "Zone",
+            "Road Type", "Lanes", "Hospitals", "Offices",
+            "Transit", "Road Crit.", "Urban Act.",
+            "Live Cong.", "Impact Score", "Why",
+        ]
+        st.dataframe(show, use_container_width=True, hide_index=True)
+    else:
+        st.info("Click the button above to fetch OSM context and compute traffic impact scores for these zones.")
