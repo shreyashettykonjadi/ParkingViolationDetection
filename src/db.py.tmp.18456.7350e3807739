@@ -144,25 +144,7 @@ def get_total_clusters():
     return int(query("SELECT COUNT(*) AS n FROM persistent_hotspots").iloc[0, 0])
 
 
-# ── Enrichment store (Objective 2) ────────────────────────────────────────────
-# Kept in a SEPARATE SQLite file so re-running build_hotspots.py (which drops and
-# recreates hotspots.db) never wipes the cached OSM context. Static OSM facts
-# (hospital/office counts, road type…) persist across rebuilds; live TomTom
-# snapshots are stored here too but are demo-grade (refreshed on every compute).
-
-ENRICH_DB_PATH = "data/enrichment.db"
-
-
-def _enrich_conn():
-    conn = sqlite3.connect(ENRICH_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _enrich_query(sql, params=()):
-    with _enrich_conn() as conn:
-        return pd.read_sql(sql, conn, params=params)
-
+# ── OSM Enrichment Cache (Objective 2) ────────────────────────────────────────
 
 ENRICHMENT_COLUMNS = [
     "cell_key", "centroid_lat", "centroid_long",
@@ -174,16 +156,9 @@ ENRICHMENT_COLUMNS = [
     "fetched_at",
 ]
 
-LIVE_TRAFFIC_COLUMNS = [
-    "cell_key", "centroid_lat", "centroid_long",
-    "current_speed", "free_flow_speed", "congestion_index",
-    "delay_ratio", "road_closure", "fetched_at",
-]
-
 
 def ensure_enrichment_table():
-    """Create both the persistent OSM cache and the live-traffic snapshot table."""
-    with _enrich_conn() as conn:
+    with _conn() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS hotspot_enrichment (
                 cell_key              TEXT PRIMARY KEY,
@@ -209,29 +184,14 @@ def ensure_enrichment_table():
                 fetched_at            TEXT
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS live_traffic (
-                cell_key         TEXT PRIMARY KEY,
-                centroid_lat     REAL,
-                centroid_long    REAL,
-                current_speed    REAL,
-                free_flow_speed  REAL,
-                congestion_index REAL,
-                delay_ratio      REAL,
-                road_closure     INTEGER,
-                fetched_at       TEXT
-            )
-        """)
         conn.commit()
 
-
-# ── OSM cache (persistent) ──
 
 def get_enrichment(cell_keys):
     if not cell_keys:
         return pd.DataFrame(columns=ENRICHMENT_COLUMNS)
     placeholders = ",".join("?" for _ in cell_keys)
-    return _enrich_query(
+    return query(
         f"SELECT * FROM hotspot_enrichment WHERE cell_key IN ({placeholders})",
         tuple(cell_keys),
     )
@@ -241,33 +201,9 @@ def upsert_enrichment(row):
     vals = [row.get(c) for c in ENRICHMENT_COLUMNS]
     placeholders = ",".join("?" for _ in ENRICHMENT_COLUMNS)
     cols = ",".join(ENRICHMENT_COLUMNS)
-    with _enrich_conn() as conn:
+    with _conn() as conn:
         conn.execute(
             f"INSERT OR REPLACE INTO hotspot_enrichment ({cols}) VALUES ({placeholders})",
             vals,
         )
         conn.commit()
-
-
-# ── Live traffic snapshots (demo) ──
-
-def upsert_live_traffic(row):
-    vals = [row.get(c) for c in LIVE_TRAFFIC_COLUMNS]
-    placeholders = ",".join("?" for _ in LIVE_TRAFFIC_COLUMNS)
-    cols = ",".join(LIVE_TRAFFIC_COLUMNS)
-    with _enrich_conn() as conn:
-        conn.execute(
-            f"INSERT OR REPLACE INTO live_traffic ({cols}) VALUES ({placeholders})",
-            vals,
-        )
-        conn.commit()
-
-
-def get_live_traffic(cell_keys):
-    if not cell_keys:
-        return pd.DataFrame(columns=LIVE_TRAFFIC_COLUMNS)
-    placeholders = ",".join("?" for _ in cell_keys)
-    return _enrich_query(
-        f"SELECT * FROM live_traffic WHERE cell_key IN ({placeholders})",
-        tuple(cell_keys),
-    )
