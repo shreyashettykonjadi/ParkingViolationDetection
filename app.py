@@ -288,17 +288,20 @@ with tab4:
 
     # ── Traffic Impact Re-Ranking (OSM-enriched) — Objective 2 ──────────────────
     st.divider()
-    st.subheader("🚦 Traffic Impact Re-Ranking (OSM-enriched)")
+    st.subheader("🚦 Traffic Impact Re-Ranking (OSM + Live Traffic)")
+    tomtom_key = st.secrets.get("TOMTOM_API_KEY", "")
     st.caption(
         "Re-ranks the same zones by **traffic impact** — road criticality + urban "
-        "context (hospitals, offices, schools, transit) on top of violation volume. "
-        "Live congestion (TomTom) reserved for the next phase."
+        "context (hospitals, offices, schools, transit) + "
+        + ("**live TomTom congestion**" if tomtom_key else "_(TomTom key not set)_")
+        + " on top of violation volume."
     )
 
-    if st.button("🔍 Compute Traffic Impact Scores (OSM)", key="enrich_btn"):
+    if st.button("🔍 Compute Traffic Impact Scores", key="enrich_btn"):
         db.ensure_enrichment_table()
-        prog = st.progress(0.0, text="Querying OpenStreetMap…")
+        prog = st.progress(0.0, text="Querying OpenStreetMap + TomTom…")
         enriched_rows = []
+        live_rows = []
         n = len(rows)
         for i, (_, r) in enumerate(rows.iterrows()):
             key = enrichment.cell_key(r["centroid_lat"], r["centroid_long"])
@@ -309,24 +312,41 @@ with tab4:
                 db.upsert_enrichment(feat)
                 cached = db.get_enrichment([key])
             enriched_rows.append(cached.iloc[0])
+            # Live congestion is fetched fresh every run (never cached permanently)
+            live_rows.append(
+                enrichment.fetch_live_traffic(r["centroid_lat"], r["centroid_long"], tomtom_key)
+            )
             prog.progress((i + 1) / n, text=f"Enriched {i + 1}/{n} zones")
         prog.empty()
+        live_df = pd.DataFrame(live_rows) if tomtom_key else None
         st.session_state[f"impact_{context}"] = enrichment.compute_impact(
-            rows, pd.DataFrame(enriched_rows)
+            rows, pd.DataFrame(enriched_rows), live=live_df
         )
 
     if f"impact_{context}" in st.session_state:
         imp = st.session_state[f"impact_{context}"]
 
-        k1, k2, k3 = st.columns(3)
+        has_live = "congestion_index" in imp.columns
+
+        k1, k2, k3, k4 = st.columns(4)
         k1.metric("Avg Impact Score", f"{imp['importance'].mean():.1f}")
         k2.metric("Top Impact Zone", f"{imp.iloc[0]['importance']:.0f}/100")
         moved = int((imp["rank_change"] != 0).sum())
         k3.metric("Zones Re-Ranked", moved)
+        if has_live:
+            k4.metric("Avg Live Congestion", f"{imp['congestion_index'].mean()*100:.0f}%")
+        else:
+            k4.metric("Live Congestion", "—")
 
         st.caption("🗺️ Sized by Traffic Impact Score | greener = higher impact")
 
         def impact_popup(row):
+            live_line = ""
+            if has_live and pd.notna(row.get("current_speed")):
+                live_line = (
+                    f"Live: {row['congestion_index']*100:.0f}% congestion "
+                    f"({int(row['current_speed'])}/{int(row['free_flow_speed'])} kmph)<br>"
+                )
             return (
                 f"<b>🚦 Impact #{int(row['new_rank'])} — {row['zone']}</b><br>"
                 f"Impact score: {row['importance']:.1f}/100<br>"
@@ -334,6 +354,7 @@ with tab4:
                 f"Road: {row['road_type'] or '—'} ({int(row['lane_count']) if pd.notna(row['lane_count']) else '?'} lanes)<br>"
                 f"Hospitals: {int(row['hospital_count'])} | Offices: {int(row['office_count'])} | "
                 f"Transit: {int(row['railway_station_count'])}<br>"
+                f"{live_line}"
                 f"Why: {row['reason']}"
             )
 
@@ -345,6 +366,9 @@ with tab4:
 
         out = imp.copy()
         out["Δ Rank"] = out["rank_change"].apply(arrow)
+        out["live_congestion"] = out["live_congestion"].apply(
+            lambda v: f"{float(v)*100:.0f}%" if isinstance(v, (int, float)) else v
+        )
         show = out[[
             "new_rank", "context_rank", "Δ Rank", "zone",
             "road_type", "lane_count", "hospital_count", "office_count",
@@ -359,4 +383,4 @@ with tab4:
         ]
         st.dataframe(show, use_container_width=True, hide_index=True)
     else:
-        st.info("Click the button above to fetch OSM context and compute traffic impact scores for these zones.")
+        st.info("Click the button above to fetch OSM context + live TomTom congestion and compute traffic impact scores for these zones.")

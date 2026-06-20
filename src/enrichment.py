@@ -18,6 +18,7 @@ import pandas as pd
 import requests
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+TOMTOM_URL = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
 # Overpass rejects the default python-requests UA (HTTP 406); identify the app.
 HEADERS = {"User-Agent": "ParkSenseAI/1.0 (parking-enforcement-research)"}
 
@@ -200,6 +201,42 @@ def enrich_centroid(lat, lon):
     return feat
 
 
+# ── Source 3: Live Traffic (PRD §13, TomTom) ─────────────────────────────────────
+
+def fetch_live_traffic(lat, lon, api_key, timeout=15):
+    """Live congestion at a centroid. NOT cached permanently — traffic is live.
+    Returns neutral values (congestion_index=0) on any failure."""
+    neutral = {
+        "current_speed": None, "free_flow_speed": None,
+        "congestion_index": 0.0, "delay_ratio": 1.0, "road_closure": 0,
+    }
+    if not api_key:
+        return neutral
+    try:
+        resp = requests.get(
+            TOMTOM_URL,
+            params={"point": f"{lat},{lon}", "unit": "KMPH", "key": api_key},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        d = resp.json().get("flowSegmentData", {})
+        cur = d.get("currentSpeed")
+        free = d.get("freeFlowSpeed")
+        ctt = d.get("currentTravelTime")
+        ftt = d.get("freeFlowTravelTime")
+        congestion = 1 - (cur / free) if cur and free else 0.0
+        delay = (ctt / ftt) if ctt and ftt else 1.0
+        return {
+            "current_speed": cur,
+            "free_flow_speed": free,
+            "congestion_index": round(max(0.0, min(1.0, congestion)), 3),
+            "delay_ratio": round(delay, 3),
+            "road_closure": 1 if d.get("roadClosure") else 0,
+        }
+    except (requests.RequestException, ValueError, KeyError, ZeroDivisionError, TypeError):
+        return neutral
+
+
 # ── Impact scoring & re-ranking ──────────────────────────────────────────────────
 
 def _minmax(s):
@@ -212,6 +249,9 @@ def _minmax(s):
 
 def _reason(row):
     bits = []
+    cong = row.get("congestion_index", 0) or 0
+    if cong >= 0.4:
+        bits.append(f"severe congestion ({cong*100:.0f}%)")
     if row["road_criticality"] >= 0.6:
         bits.append(f"{(row['road_type'] or 'major road').replace('_', ' ').title()}")
     if row["hospital_count"] > 0:
@@ -227,10 +267,12 @@ def _reason(row):
     return " · ".join(bits[:3]) if bits else "moderate impact factors"
 
 
-def compute_impact(hotspots, enriched):
+def compute_impact(hotspots, enriched, live=None):
     """
     hotspots : top-N contextual hotspots DataFrame (from db.get_contextual_hotspots)
     enriched : matching OSM features DataFrame (one row per hotspot, same order)
+    live     : optional matching live-traffic DataFrame (TomTom). If provided, a
+               live-congestion component is added and weights are re-balanced.
     Returns a DataFrame sorted by importance desc with factor columns + reason.
     """
     df = hotspots.reset_index(drop=True).copy()
@@ -270,17 +312,34 @@ def compute_impact(hotspots, enriched):
     # Existing parking-volume signal (already 0–1)
     df["enforcement_norm"] = df["enforcement_score"].astype(float).clip(0, 1)
 
-    # Reserved live-congestion slot (neutral until TomTom key)
-    df["live_congestion"] = "—"
-
-    # Weighted-sum Traffic Impact Score (0–100); weights sum to 1.00
-    df["importance"] = (100 * (
-        0.35 * df["enforcement_norm"]
-        + 0.20 * df["road_criticality"]
-        + 0.20 * df["urban_activity"]
-        + 0.15 * df["vehicle_severity"]
-        + 0.10 * df["junction_risk"]
-    )).round(1)
+    # Component: live congestion (TomTom). If no live data, neutral & weight folded out.
+    has_live = live is not None
+    if has_live:
+        lv = live.reset_index(drop=True)
+        df["congestion_index"] = lv["congestion_index"].astype(float).values
+        df["current_speed"] = lv["current_speed"].values
+        df["free_flow_speed"] = lv["free_flow_speed"].values
+        df["road_closure"] = lv["road_closure"].values
+        df["live_congestion"] = df["congestion_index"]
+        # 6-component formula (weights sum to 1.00)
+        df["importance"] = (100 * (
+            0.30 * df["enforcement_norm"]
+            + 0.18 * df["road_criticality"]
+            + 0.18 * df["urban_activity"]
+            + 0.14 * df["congestion_index"]
+            + 0.12 * df["vehicle_severity"]
+            + 0.08 * df["junction_risk"]
+        )).round(1)
+    else:
+        df["live_congestion"] = "—"
+        # 5-component formula (no live data; weights sum to 1.00)
+        df["importance"] = (100 * (
+            0.35 * df["enforcement_norm"]
+            + 0.20 * df["road_criticality"]
+            + 0.20 * df["urban_activity"]
+            + 0.15 * df["vehicle_severity"]
+            + 0.10 * df["junction_risk"]
+        )).round(1)
 
     df["zone"] = df["police_station"].astype(str) + " / " + (
         df["nearest_junction"].fillna("—").astype(str)

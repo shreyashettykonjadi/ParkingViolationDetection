@@ -128,10 +128,15 @@ So when we count "15 hospitals nearby," that is **15 hospitals within 1 km of th
 cluster's geographic center** — the actual place the illegal parking is
 happening — which is exactly what we want.
 
-| Query | Radius around centroid | Returns |
-|---|---|---|
-| Road features (OSM §11) | 50 m | road type, lane count, oneway, segment length |
-| Urban context (OSM §12) | 1000 m | counts of hospitals, offices, schools, transit, malls, etc. |
+| Query | Radius around centroid | Returns | Cached? |
+|---|---|---|---|
+| Road features (OSM §11) | 50 m | road type, lane count, oneway, segment length | Yes (permanent) |
+| Urban context (OSM §12) | 1000 m | counts of hospitals, offices, schools, transit, malls, etc. | Yes (permanent) |
+| Live traffic (TomTom §13) | road segment at centroid | current speed, free-flow speed, congestion index | No — fetched fresh each run |
+
+OSM data is static, so it is cached permanently in `hotspot_enrichment`. **TomTom
+congestion is live** — it changes minute to minute — so it is fetched fresh on
+every button press and never written to the permanent cache.
 
 Results are cached in the `hotspot_enrichment` SQLite table, keyed by the
 centroid rounded to 4 decimals (~11 m grid), so the same place is never queried
@@ -171,30 +176,46 @@ junction_risk = 1  if nearest_junction is a real junction
               = 0  if "No Junction" / null
 ```
 
+**(e) Live Congestion** — actual measured traffic slowdown at the centroid.
+```
+congestion_index = 1 − (current_speed / free_flow_speed)   # 0–1, from TomTom
+# e.g. 36 kmph vs 52 free-flow → 1 − 36/52 = 0.31 (31% congestion)
+```
+
 ### 4.3 The final Impact Score formula
 
+The formula has **two forms** depending on whether a TomTom key is configured.
+
+**With live traffic (6 components — the active formula when a TomTom key is set):**
 ```
 Impact Score (0–100) = 100 × (
-      0.35 × enforcement_norm     # parking volume + recency (the §3 score)
-    + 0.20 × road_criticality     # OSM road importance + lanes
-    + 0.20 × urban_activity       # OSM hospitals/offices/transit/etc.
-    + 0.15 × vehicle_severity     # dominant vehicle footprint
-    + 0.10 × junction_risk        # at a junction or not
+      0.30 × enforcement_norm     # parking volume + recency (the §3 score)
+    + 0.18 × road_criticality     # OSM road importance + lanes
+    + 0.18 × urban_activity       # OSM hospitals/offices/transit/etc.
+    + 0.14 × congestion_index     # TomTom live congestion
+    + 0.12 × vehicle_severity     # dominant vehicle footprint
+    + 0.08 × junction_risk        # at a junction or not
 )
 # weights sum to 1.00
 ```
 
-| Weight | Component | Source |
-|---|---|---|
-| 0.35 | `enforcement_norm` | existing contextual score (§3) — already 0–1 |
-| 0.20 | `road_criticality` | OSM road query (centroid, 50 m) |
-| 0.20 | `urban_activity` | OSM context query (centroid, 1 km) |
-| 0.15 | `vehicle_severity` | cluster's dominant vehicle type |
-| 0.10 | `junction_risk` | cluster's nearest_junction field |
+**Without live traffic (5 components — fallback if no key / TomTom fails):**
+```
+Impact Score (0–100) = 100 × (
+      0.35 × enforcement_norm + 0.20 × road_criticality
+    + 0.20 × urban_activity + 0.15 × vehicle_severity + 0.10 × junction_risk
+)
+# congestion weight folded back into the other five; still sums to 1.00
+```
 
-> **Reserved:** a **Live Congestion** component (TomTom) has a slot in the table
-> ("—") and will be folded into this formula with its own weight once a TomTom
-> API key is supplied. Weights will be re-balanced to still sum to 1.00.
+| Weight (live) | Component | Source |
+|---|---|---|
+| 0.30 | `enforcement_norm` | existing contextual score (§3) — already 0–1 |
+| 0.18 | `road_criticality` | OSM road query (centroid, 50 m) |
+| 0.18 | `urban_activity` | OSM context query (centroid, 1 km) |
+| 0.14 | `congestion_index` | TomTom Flow Segment API (centroid, live) |
+| 0.12 | `vehicle_severity` | cluster's dominant vehicle type |
+| 0.08 | `junction_risk` | cluster's nearest_junction field |
 
 ### 4.4 Re-ranking output
 
@@ -234,5 +255,5 @@ K.R. Pura zone, weekday evening peak:
 | What is the contextual score based on? | 60% all-time violation volume + 40% last-30-day volume, as percentiles within the context. No road/urban data. |
 | How is a police station assigned? | Majority vote — the station that logged the most violations in the cluster (statistical mode). |
 | Multiple stations in one hotspot? | Yes possible; only the **dominant** one is shown. It's a display label only — no calculation uses it. Documented limitation. |
-| What coordinates fetch hospital/office data? | The **hotspot centroid** (mean of violation lat/long), never the police station location. Road = 50 m, urban = 1 km radius. |
-| Impact score formula? | `100 × (0.35·enforcement + 0.20·road + 0.20·urban + 0.15·vehicle + 0.10·junction)` — see §4.3. |
+| What coordinates fetch hospital/office data? | The **hotspot centroid** (mean of violation lat/long), never the police station location. Road = 50 m, urban = 1 km, TomTom = segment at centroid. |
+| Impact score formula? | Live: `100 × (0.30·enforcement + 0.18·road + 0.18·urban + 0.14·congestion + 0.12·vehicle + 0.08·junction)`. Fallback without TomTom drops congestion and re-balances. See §4.3. |
