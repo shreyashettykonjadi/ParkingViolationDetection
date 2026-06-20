@@ -69,12 +69,29 @@ if not Path(DB_PATH).exists():
 
 from src import db
 from src import enrichment
+from src import action, briefing, dispatch, stations
 
 MONTH_LABEL   = db.MONTH_LABELS
 SHIFT_DISPLAY = db.SHIFT_DISPLAY
 
 # Shared station list (NaN-cleaned in db.get_police_stations)
 STATIONS = db.get_police_stations()
+
+# Span of the historical dataset — used by the action layer to judge recent spikes.
+def _window_days():
+    try:
+        lo = pd.to_datetime(db.get_meta("min_date"))
+        hi = pd.to_datetime(db.get_meta("max_date"))
+        return max(30, int((hi - lo).days))
+    except Exception:
+        return 181
+
+WINDOW_DAYS = _window_days()
+
+
+def get_tomtom_key():
+    """TomTom key from a sidebar override (session) or .streamlit/secrets.toml."""
+    return st.session_state.get("tomtom_key_override") or st.secrets.get("TOMTOM_API_KEY", "")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -141,12 +158,15 @@ st.sidebar.markdown("## 🚔 ParkSense AI")
 st.sidebar.caption("AI-Driven Parking Intelligence")
 
 NAV_ITEMS = [
+    ("Command Center",      "🎯"),
+    ("Briefings",           "📝"),
+    ("Patrol Dispatch",     "🚓"),
+    ("Live Enforcement",    "🟠"),
     ("Violation Explorer",  "🔍"),
     ("Persistent Hotspots", "🔴"),
     ("Monthly Hotspots",    "🟣"),
-    ("Live Enforcement",    "🟠"),
 ]
-st.session_state.setdefault("view", NAV_ITEMS[0][0])
+st.session_state.setdefault("view", "Command Center")
 
 for name, icon in NAV_ITEMS:
     is_active = st.session_state["view"] == name
@@ -161,6 +181,17 @@ for name, icon in NAV_ITEMS:
 
 view = st.session_state["view"]
 st.sidebar.divider()
+
+# TomTom key: prefilled from secrets.toml if present, overridable here for demos.
+with st.sidebar.expander("🔑 TomTom API key"):
+    _has_secret = bool(st.secrets.get("TOMTOM_API_KEY", ""))
+    st.text_input(
+        "Key (overrides secrets.toml)",
+        key="tomtom_key_override", type="password",
+        placeholder="set in secrets.toml" if _has_secret else "paste key for live routing",
+    )
+    st.caption("✅ Key loaded from secrets.toml" if _has_secret
+               else "⚠️ No key in secrets — routing falls back to estimates without one.")
 
 st.title("🚔 ParkSense AI")
 st.caption("AI-Driven Parking Intelligence & Enforcement Dashboard")
@@ -402,10 +433,62 @@ def render_live_enforcement():
 
 # ── Objective 2: Traffic Impact Re-Ranking (OSM + live TomTom) ──────────────────
 
+def compute_impact_for_context(rows, context):
+    """Enrich the given hotspot rows (OSM context + live TomTom) and store the
+    impact DataFrame in session_state under `impact_{context}`. Shared by the Live
+    Enforcement tab and the action-layer 'Enrich' button so there is one code path
+    and no duplicate API calls."""
+    tomtom_key = get_tomtom_key()
+    db.ensure_enrichment_table()
+    prog = st.progress(0.0, text="Querying OpenStreetMap + TomTom…")
+    enriched_rows, live_rows = [], []
+    n = len(rows)
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    for i, (_, r) in enumerate(rows.iterrows()):
+        key = enrichment.cell_key(r["centroid_lat"], r["centroid_long"])
+
+        # OSM context — persisted in enrichment.db, fetched once per ~11 m cell
+        cached = db.get_enrichment([key])
+        if len(cached) == 0:
+            feat = enrichment.enrich_centroid(r["centroid_lat"], r["centroid_long"])
+            feat["cell_key"] = key
+            db.upsert_enrichment(feat)
+            cached = db.get_enrichment([key])
+        enriched_rows.append(cached.iloc[0])
+
+        # Live congestion — fetched fresh, stored as a demo snapshot
+        live = enrichment.fetch_live_traffic(
+            r["centroid_lat"], r["centroid_long"], tomtom_key
+        )
+        live.update({
+            "cell_key": key,
+            "centroid_lat": float(r["centroid_lat"]),
+            "centroid_long": float(r["centroid_long"]),
+            "fetched_at": now_iso,
+        })
+        if tomtom_key:
+            db.upsert_live_traffic(live)
+        live_rows.append(live)
+
+        prog.progress((i + 1) / n, text=f"Enriched {i + 1}/{n} zones")
+    prog.empty()
+
+    enriched_df = pd.DataFrame(enriched_rows).reset_index(drop=True)
+    live_df = pd.DataFrame(live_rows) if tomtom_key else None
+    st.session_state[f"osm_{context}"]  = enriched_df
+    st.session_state[f"live_{context}"] = live_df
+    st.session_state[f"impact_{context}"] = enrichment.compute_impact(
+        rows, enriched_df,
+        live=live_df[["congestion_index", "current_speed",
+                      "free_flow_speed", "road_closure"]] if live_df is not None else None,
+    )
+
+
 def _render_traffic_impact(rows, context):
     st.divider()
     st.subheader("🚦 Traffic Impact Re-Ranking (OSM + Live Traffic)")
-    tomtom_key = st.secrets.get("TOMTOM_API_KEY", "")
+    tomtom_key = get_tomtom_key()
     st.caption(
         "Re-ranks the same zones by **traffic impact** — road criticality + urban "
         "context (hospitals, offices, schools, transit) + "
@@ -414,50 +497,7 @@ def _render_traffic_impact(rows, context):
     )
 
     if st.button("🔍 Compute Traffic Impact Scores", key="enrich_btn"):
-        db.ensure_enrichment_table()
-        prog = st.progress(0.0, text="Querying OpenStreetMap + TomTom…")
-        enriched_rows, live_rows = [], []
-        n = len(rows)
-        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-        for i, (_, r) in enumerate(rows.iterrows()):
-            key = enrichment.cell_key(r["centroid_lat"], r["centroid_long"])
-
-            # OSM context — persisted in enrichment.db, fetched once per ~11 m cell
-            cached = db.get_enrichment([key])
-            if len(cached) == 0:
-                feat = enrichment.enrich_centroid(r["centroid_lat"], r["centroid_long"])
-                feat["cell_key"] = key
-                db.upsert_enrichment(feat)
-                cached = db.get_enrichment([key])
-            enriched_rows.append(cached.iloc[0])
-
-            # Live congestion — fetched fresh, stored as a demo snapshot
-            live = enrichment.fetch_live_traffic(
-                r["centroid_lat"], r["centroid_long"], tomtom_key
-            )
-            live.update({
-                "cell_key": key,
-                "centroid_lat": float(r["centroid_lat"]),
-                "centroid_long": float(r["centroid_long"]),
-                "fetched_at": now_iso,
-            })
-            if tomtom_key:
-                db.upsert_live_traffic(live)
-            live_rows.append(live)
-
-            prog.progress((i + 1) / n, text=f"Enriched {i + 1}/{n} zones")
-        prog.empty()
-
-        enriched_df = pd.DataFrame(enriched_rows).reset_index(drop=True)
-        live_df = pd.DataFrame(live_rows) if tomtom_key else None
-        st.session_state[f"osm_{context}"]  = enriched_df
-        st.session_state[f"live_{context}"] = live_df
-        st.session_state[f"impact_{context}"] = enrichment.compute_impact(
-            rows, enriched_df,
-            live=live_df[["congestion_index", "current_speed",
-                          "free_flow_speed", "road_closure"]] if live_df is not None else None,
-        )
+        compute_impact_for_context(rows, context)
 
     if f"impact_{context}" not in st.session_state:
         st.info("Click the button above to fetch OSM context + live TomTom congestion "
@@ -554,10 +594,422 @@ def _render_traffic_impact(rows, context):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# ACTION LAYER — shared context + hotspot loader for the three action views
+# ════════════════════════════════════════════════════════════════════════════════
+
+ACTION_POOL = 20   # how many ranked hotspots the action layer considers
+
+
+def _action_context_controls():
+    """Sidebar context picker shared by Command Center / Briefings / Dispatch.
+    Widget state is keyed (act_*) so all three views stay in sync."""
+    IST = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(IST)
+    auto_day    = "weekend" if now.weekday() >= 5 else "weekday"
+    auto_bucket = _hour_to_bucket(now.hour)
+    DAY_TYPES   = ["weekday", "weekend"]
+    ALL_BUCKETS = list(SHIFT_DISPLAY.keys())
+
+    st.sidebar.subheader("Operational Context")
+    follow = st.sidebar.toggle("🔴 Follow live IST", value=True, key="act_follow_live",
+                               help="ON = current IST day/time. OFF = choose any context.")
+    if follow:
+        st.sidebar.info(f"🕐 {now.strftime('%H:%M')} · {now.strftime('%A')}\n\n"
+                        f"→ **{auto_day} / {SHIFT_DISPLAY[auto_bucket]}**")
+        sel_day, sel_bucket = auto_day, auto_bucket
+    else:
+        sel_day = st.sidebar.selectbox("Day Type", DAY_TYPES,
+                                       index=DAY_TYPES.index(auto_day), key="act_day")
+        sel_bucket = st.sidebar.selectbox("Time Bucket", ALL_BUCKETS,
+                                          index=ALL_BUCKETS.index(auto_bucket),
+                                          format_func=lambda k: SHIFT_DISPLAY[k],
+                                          key="act_bucket")
+    return f"{sel_day}_{sel_bucket}", now
+
+
+def load_action_hotspots(context):
+    """Build (and cache in session_state) the ranked action-hotspot list — the
+    single source of truth shared by all three action views."""
+    rows = db.get_contextual_hotspots(context, limit=ACTION_POOL)
+    impact_df = st.session_state.get(f"impact_{context}")
+    hotspots = action.build_action_hotspots(rows, context, WINDOW_DAYS, impact_df)
+    st.session_state["action_hotspots"] = hotspots
+    st.session_state["action_context"]  = context
+    return rows, hotspots
+
+
+def _severity_badge(severity):
+    color = action.SEVERITY_COLORS.get(severity, "#777")
+    return (f"<span style='background:{color};color:#fff;padding:2px 10px;"
+            f"border-radius:999px;font-weight:700;font-size:0.78rem;"
+            f"letter-spacing:.04em;'>{severity}</span>")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# VIEW — COMMAND CENTER  (Feature 2, default landing)
+# ════════════════════════════════════════════════════════════════════════════════
+
+def render_command_center():
+    context, _ = _action_context_controls()
+    rows, hotspots = load_action_hotspots(context)
+
+    st.sidebar.divider()
+    st.sidebar.caption("Enrich adds road type, hospital/office counts and live "
+                       "congestion (OSM + TomTom) to the cards.")
+    if st.sidebar.button("⚡ Enrich (OSM + TomTom)", width="stretch", key="cc_enrich"):
+        if len(rows):
+            compute_impact_for_context(rows, context)
+            st.rerun()
+
+    st.header("🎯 Command Center")
+    st.caption(f"What should we do right now? · Context `{context}` · "
+               f"{SHIFT_DISPLAY[context.split('_', 1)[1]]}")
+
+    if not hotspots:
+        st.warning("No hotspot data for this context. Re-run `build_hotspots.py` "
+                   "or pick another context.")
+        return
+
+    enriched = any(h["enriched"] for h in hotspots)
+    dispatch_res = st.session_state.get(f"dispatch_{context}")
+    eta_by_cluster = (dispatch_res or {}).get("eta_by_cluster", {})
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Priority Zones", len(hotspots))
+    k2.metric("HIGH Severity", sum(h["severity"] == "HIGH" for h in hotspots))
+    k3.metric("Top Impact", f"{hotspots[0]['traffic_impact']} / 100")
+    k4.metric("Units Dispatched", len(dispatch_res["assignments"]) if dispatch_res else 0)
+
+    if not enriched:
+        st.info("ℹ️ Cards show violation-based priority. Click **⚡ Enrich (OSM + "
+                "TomTom)** in the sidebar to add road type, hospital/office counts "
+                "and live congestion.")
+    if not dispatch_res:
+        st.info("ℹ️ Nearest-unit ETAs appear here once you run **Patrol Dispatch**.")
+
+    st.divider()
+    for h in hotspots:
+        _render_priority_card(h, eta_by_cluster.get(h["cluster_id"]))
+
+
+def _render_priority_card(h, eta_info):
+    sev_color = action.SEVERITY_COLORS.get(h["severity"], "#777")
+    with st.container(border=True):
+        left, mid, right = st.columns([3.2, 1.6, 1.6])
+
+        with left:
+            st.markdown(
+                f"<div style='display:flex;align-items:center;gap:10px;'>"
+                f"<span style='background:#1b2130;color:#fff;padding:3px 12px;"
+                f"border-radius:8px;font-weight:700;'>Priority #{h['priority_rank']}</span>"
+                f"{_severity_badge(h['severity'])}</div>"
+                f"<h3 style='margin:.35rem 0 .1rem 0;'>{h['location']}</h3>"
+                f"<div style='color:#444;font-weight:600;'>➡️ {h['recommended_action']}</div>",
+                unsafe_allow_html=True,
+            )
+            if h["why_factors"]:
+                items = "".join(f"<li>✅ {f}</li>" for f in h["why_factors"])
+                st.markdown(
+                    f"<div style='margin-top:.5rem;font-size:0.9rem;'>"
+                    f"<b>Why this location?</b><ul style='margin:.2rem 0 0 0;"
+                    f"padding-left:1.1rem;'>{items}</ul></div>",
+                    unsafe_allow_html=True,
+                )
+
+        with mid:
+            st.metric("Traffic Impact", f"{h['traffic_impact']} / 100")
+            st.metric("Forecast Risk", f"{h['forecast_risk']}%")
+
+        with right:
+            if eta_info:
+                src = "🟢 live" if eta_info["source"] == "tomtom" else "🟡 est"
+                st.markdown(
+                    f"<div style='font-size:0.8rem;color:#666;'>NEAREST UNIT ETA</div>"
+                    f"<div style='font-size:2.0rem;font-weight:800;color:{sev_color};"
+                    f"line-height:1.1;'>{dispatch.fmt_eta(eta_info['eta_sec'])}</div>"
+                    f"<div style='font-size:0.8rem;color:#666;'>{eta_info['unit']} · "
+                    f"{eta_info['station']} · {src}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    "<div style='font-size:0.8rem;color:#666;'>NEAREST UNIT ETA</div>"
+                    "<div style='font-size:1.4rem;font-weight:700;color:#999;'>—</div>"
+                    "<div style='font-size:0.75rem;color:#999;'>run Patrol Dispatch</div>",
+                    unsafe_allow_html=True,
+                )
+
+        with st.expander("📝 Full operational briefing"):
+            st.code(briefing.generate_briefing(h), language=None)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# VIEW — BRIEFINGS  (Feature 1)
+# ════════════════════════════════════════════════════════════════════════════════
+
+def render_briefings():
+    context, _ = _action_context_controls()
+    _, hotspots = load_action_hotspots(context)
+
+    st.header("📝 Smart Briefings")
+    st.caption(f"Shift-ready, plain-English operational summaries · Context `{context}`")
+
+    if not hotspots:
+        st.warning("No hotspot data for this context.")
+        return
+
+    c1, c2 = st.columns([1, 3])
+    gen_all = c1.button("🗒️ Generate All Briefings", type="primary")
+
+    if gen_all:
+        combined = "\n\n".join(
+            f"PRIORITY #{h['priority_rank']} — {h['location']} [{h['severity']}]\n"
+            + briefing.generate_briefing(h)
+            for h in hotspots
+        )
+        header = (f"BENGALURU TRAFFIC POLICE — SHIFT BRIEFING\n"
+                  f"Context: {context}\nGenerated: "
+                  f"{datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M IST')}\n"
+                  f"{'='*60}\n\n")
+        st.download_button(
+            "⬇️ Download All Briefings (.txt)", header + combined,
+            file_name=f"shift_briefing_{context}_"
+                      f"{datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d')}.txt",
+            mime="text/plain", key="dl_all",
+        )
+
+    st.divider()
+    for h in hotspots:
+        text = briefing.generate_briefing(h)
+        with st.expander(
+            f"Priority #{h['priority_rank']} · {h['location']} · {h['severity']}",
+            expanded=gen_all,
+        ):
+            st.code(text, language=None)   # st.code → built-in copy icon
+            st.download_button(
+                "⬇️ Download Briefing", text,
+                file_name=briefing.briefing_filename(h),
+                mime="text/plain", key=f"dl_{h['cluster_id']}_{h['priority_rank']}",
+            )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# VIEW — PATROL DISPATCH  (Feature 3, TomTom routing)
+# ════════════════════════════════════════════════════════════════════════════════
+
+SEVERITY_MARKER = {"HIGH": "red", "MEDIUM": "orange", "LOW": "green"}
+
+
+def _parse_manual_units(text):
+    """Parse 'Name,lat,lng' (or 'lat,lng') lines into manual unit origins."""
+    units = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        try:
+            if len(parts) == 3:
+                name, lat, lng = parts[0], float(parts[1]), float(parts[2])
+            elif len(parts) == 2:
+                name, lat, lng = "On-road", float(parts[0]), float(parts[1])
+            else:
+                continue
+            if dispatch.valid_coord(lat, lng):
+                units.append({"station": name or "On-road", "lat": lat, "lng": lng})
+        except ValueError:
+            continue
+    return units
+
+
+def render_patrol_dispatch():
+    context, _ = _action_context_controls()
+    _, hotspots = load_action_hotspots(context)
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Dispatch Controls")
+    sel_stations = st.sidebar.multiselect(
+        "Active patrol units (stations)", stations.station_names(),
+        default=stations.default_active_units(),
+    )
+    manual_text = st.sidebar.text_area(
+        "Manual on-road units", placeholder="UnitName,lat,lng\n12.93,77.62",
+        help="One per line: 'Name,lat,lng' (or just 'lat,lng').", height=80,
+    )
+    max_n = max(1, len(hotspots))
+    n_targets = st.sidebar.number_input(
+        "Top-priority hotspots to dispatch to", min_value=1,
+        max_value=max_n, value=min(3, max_n), step=1,
+    )
+    refresh = st.sidebar.button("🔄 Compute / Refresh Routing", type="primary",
+                                width="stretch")
+
+    st.header("🚓 Patrol Dispatch")
+    st.caption(f"Who should go where? · Context `{context}` · "
+               "TomTom Matrix Routing + Calculate Route")
+
+    if not hotspots:
+        st.warning("No hotspot data for this context.")
+        return
+
+    # Assemble unit origins (stations first, then manual on-road units).
+    origins = []
+    for name in sel_stations:
+        c = stations.station_coords(name)
+        if c:
+            origins.append({"station": name, "lat": c[0], "lng": c[1]})
+    origins.extend(_parse_manual_units(manual_text))
+
+    if refresh:
+        if not origins:
+            st.error("Select at least one patrol unit (or add a manual on-road unit).")
+        else:
+            _run_dispatch(context, hotspots, origins, int(n_targets))
+
+    result = st.session_state.get(f"dispatch_{context}")
+    if not result:
+        st.info("Set your units and target count in the sidebar, then click "
+                "**Compute / Refresh Routing**.")
+        return
+
+    if result["source"] != "tomtom":
+        st.warning("⚠️ " + (result.get("matrix_warning") or
+                   "ETAs/routes are haversine estimates (~25 km/h), not live TomTom data."))
+    else:
+        st.success("✅ ETAs and routes are live, traffic-aware TomTom data.")
+
+    # ── Assignment table ──
+    st.subheader("📋 Patrol Assignment Table")
+    table = pd.DataFrame([{
+        "Patrol/Unit": a["unit"],
+        "Station Origin": a["station"],
+        "Assigned Hotspot": a["hotspot_location"],
+        "Severity": a["severity"],
+        "ETA": dispatch.fmt_eta(a["eta_sec"]),
+        "Distance": dispatch.fmt_distance(a["distance_m"]),
+        "Source": "TomTom" if a["route_source"] == "tomtom" else "Estimate",
+    } for a in result["assignments"]])
+    st.dataframe(table, width="stretch", hide_index=True)
+
+    # ── Route map ──
+    st.subheader("🗺️ Dispatch Map")
+    route_labels = ["Show All Routes"] + [
+        f"{a['unit']} → {a['hotspot_location']}" for a in result["assignments"]
+    ]
+    sel_route = st.selectbox("Highlight route", route_labels)
+    _render_dispatch_map(result, sel_route)
+
+
+def _run_dispatch(context, hotspots, origins, n_targets):
+    api_key = get_tomtom_key()
+    targets = hotspots[:n_targets]                      # already priority-ordered
+    o_coords = [(o["lat"], o["lng"]) for o in origins]
+    d_coords = [(h["centroid_lat"], h["centroid_long"]) for h in targets]
+
+    with st.spinner("Computing travel-time matrix (TomTom Matrix Routing v2)…"):
+        mat = dispatch.compute_travel_matrix(o_coords, d_coords, api_key)
+    assigns = dispatch.greedy_assign(mat["matrix"], len(origins), len(targets))
+
+    assignments, eta_by_cluster = [], {}
+    route_source_any_estimate = mat["source"] != "tomtom"
+    with st.spinner("Fetching final route geometry (TomTom Calculate Route)…"):
+        for k, a in enumerate(assigns):
+            o = origins[a["origin_index"]]
+            h = targets[a["dest_index"]]
+            route = dispatch.calculate_route(
+                o["lat"], o["lng"], h["centroid_lat"], h["centroid_long"], api_key
+            )
+            if route["source"] != "tomtom":
+                route_source_any_estimate = True
+            unit = f"Patrol {chr(65 + k)}"               # Patrol A, B, C…
+            assignments.append({
+                "unit": unit,
+                "station": o["station"],
+                "origin": (o["lat"], o["lng"]),
+                "hotspot_location": h["location"],
+                "hotspot_cluster_id": h["cluster_id"],
+                "dest": (h["centroid_lat"], h["centroid_long"]),
+                "severity": h["severity"],
+                "eta_sec": route["eta_sec"],
+                "distance_m": route["distance_m"],
+                "points": route["points"],
+                "route_source": route["source"],
+            })
+            eta_by_cluster[h["cluster_id"]] = {
+                "eta_sec": route["eta_sec"], "unit": unit,
+                "station": o["station"], "source": route["source"],
+            }
+
+    st.session_state[f"dispatch_{context}"] = {
+        "context": context,
+        "source": "tomtom" if not route_source_any_estimate else "estimate",
+        "matrix_warning": mat.get("warning"),
+        "assignments": assignments,
+        "eta_by_cluster": eta_by_cluster,
+    }
+
+
+def _render_dispatch_map(result, sel_route):
+    m = folium.Map(location=[12.97, 77.59], zoom_start=12, tiles="cartodbpositron")
+    all_pts = []
+
+    # Origin markers (patrol units) — blue.
+    seen_origins = set()
+    for a in result["assignments"]:
+        if a["origin"] in seen_origins:
+            continue
+        seen_origins.add(a["origin"])
+        folium.Marker(
+            location=list(a["origin"]),
+            icon=folium.Icon(color="blue", icon="car", prefix="fa"),
+            popup=folium.Popup(f"<b>{a['unit']}</b><br>{a['station']} PS", max_width=250),
+        ).add_to(m)
+        all_pts.append(a["origin"])
+
+    # Hotspot markers — colored by severity.
+    for a in result["assignments"]:
+        folium.Marker(
+            location=list(a["dest"]),
+            icon=folium.Icon(color=SEVERITY_MARKER.get(a["severity"], "gray"),
+                             icon="triangle-exclamation", prefix="fa"),
+            popup=folium.Popup(
+                f"<b>{a['hotspot_location']}</b><br>{a['severity']}<br>"
+                f"ETA {dispatch.fmt_eta(a['eta_sec'])} · {dispatch.fmt_distance(a['distance_m'])}",
+                max_width=260),
+        ).add_to(m)
+        all_pts.append(a["dest"])
+
+    # Route polylines.
+    show_all = sel_route == "Show All Routes"
+    for a in result["assignments"]:
+        label = f"{a['unit']} → {a['hotspot_location']}"
+        highlighted = show_all or label == sel_route
+        color = action.SEVERITY_COLORS.get(a["severity"], "#3388ff")
+        folium.PolyLine(
+            locations=[list(p) for p in a["points"]],
+            color=color, weight=6 if highlighted else 2,
+            opacity=0.9 if highlighted else 0.25,
+            dash_array=None if a["route_source"] == "tomtom" else "8,8",
+            tooltip=f"{label} · {dispatch.fmt_eta(a['eta_sec'])}",
+        ).add_to(m)
+        if highlighted:
+            all_pts.extend(a["points"])
+
+    if all_pts:
+        lats = [p[0] for p in all_pts]; lons = [p[1] for p in all_pts]
+        m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(40, 40))
+    st_folium(m, width=1200, height=560, key=f"dispatch_map_{result['context']}",
+              returned_objects=[])
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Router
 # ════════════════════════════════════════════════════════════════════════════════
 
-if   view == "Violation Explorer":  render_violation_explorer()
+if   view == "Command Center":      render_command_center()
+elif view == "Briefings":           render_briefings()
+elif view == "Patrol Dispatch":     render_patrol_dispatch()
+elif view == "Violation Explorer":  render_violation_explorer()
 elif view == "Persistent Hotspots": render_persistent()
 elif view == "Monthly Hotspots":    render_monthly()
 elif view == "Live Enforcement":    render_live_enforcement()
