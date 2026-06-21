@@ -1,0 +1,131 @@
+THE PROBLEM
+On-street illegal parking near commercial areas, metro stations and events chokes
+carriageways and intersections. Enforcement today is patrol-based and REACTIVE —
+officers go where they already expect violations. There is no heatmap of parking
+violations vs. their congestion impact, and it is hard to prioritise which zones to
+police. Direction: how can AI-driven parking intelligence detect illegal-parking
+hotspots and QUANTIFY their impact on traffic flow to enable TARGETED enforcement?
+
+NagaraNetra answers this end-to-end on ~298,450 real Bengaluru Traffic Police
+records (54 stations, Nov 2023 – Apr 2024) across three objectives: DETECT where/when
+parking clusters, QUANTIFY how much each cluster hurts traffic, and PREDICT tomorrow's
+hotspots so patrols are pre-positioned instead of dispatched after the fact.
+
+ARCHITECTURE — "BUILD ONCE, QUERY ALWAYS"
+All heavy compute runs OFFLINE, once, and is persisted to SQLite. The Streamlit
+dashboard is read-only and never runs clustering or ML at session time, so every tab
+loads sub-second on indexed reads. Three separate databases (hotspots / enrichment /
+forecast) so each survives the others' rebuilds. A real correctness fix: the raw CSV's
+time fields were in UTC, but Bengaluru is UTC+5:30 — every temporal field is re-derived
+in IST before bucketing, so time buckets and the app's "current-IST -> context" logic
+aren't misaligned by 5.5 hours.
+
+OBJECTIVE 1 — MULTI-CONTEXT HOTSPOT DETECTION (17 HDBSCAN RUNS)
+HDBSCAN clusters the geographic points (metric = haversine; selection = excess-of-mass).
+It needs no preset zone count, finds clusters of arbitrary shape and uneven density, and
+labels sparse points as noise so we never patrol non-problems. We build THREE layers = 1 + 10 + 6 = 17 runs:
+  • Persistent (1 run, min_cluster_size 30): full dataset -> 1,992 chronic all-time zones.
+  • Contextual (10 runs, size 15): one HDBSCAN per (day_type x time_bucket) = weekday/
+    weekend x night/morning_peak/midday/evening_peak/late_night -> 5,386 clusters. Powers
+    Live Enforcement.
+  • Monthly (6 runs, size 20): one HDBSCAN per month -> 4,177 clusters; shows how hotspot
+    geography emerges/shifts over time.
+
+WHY 17 SEPARATE RUNS BEAT ONE GLOBAL HDBSCAN + "FILTER BY TIME":
+A single global clustering computes its density, cluster boundaries AND noise labels from
+the WHOLE-YEAR distribution. Filtering that one model by time only subsets points inside
+FIXED zones whose geometry was frozen by annual density — it silently assumes
+Hotspot(location, TimeA) == Hotspot(location, TimeB). But parking density is itself
+context-dependent: an office spot dense on weekday mornings is empty on weekend nights,
+and a real ~18-point weekend-night nightlife cluster would never survive a global
+min_cluster_size=30 over a whole year — so a single-model-then-filter system is BLIND to
+it. Re-running HDBSCAN independently per context re-derives density, boundaries and noise
+from only that context's points, so cluster geometry is ALLOWED to change with context,
+min_cluster_size is tuned per scope (30/15/20), new context-only zones appear and vanished
+ones drop out, and each layer is ranked by the right signal. We TEST the assumption
+instead of accepting it — a more rigorous basis for time-sensitive enforcement.
+
+OBJECTIVE 2 — QUANTIFYING TRAFFIC IMPACT (ENRICHED ENFORCEMENT QUEUE)
+Counting tickets is not measuring congestion. Two stages:
+Stage A — Enforcement Score (violation pressure, no external data):
+  enforcement_score = 0.6 x percentile(all-time volume in context)
+                    + 0.4 x percentile(recent volume, last 30 days)
+  60% = chronic pattern; 40% = momentum (getting worse now). Gives the first queue.
+Stage B — Traffic Impact Re-Ranking: each top zone's CENTROID (mean lat/long of its
+violations, never the station location) is enriched and re-scored 0–100, then RE-RANKED
+with a Δ-rank arrow vs the volume-only order, fusing:
+  • ROAD CRITICALITY (OSM 50 m): highway class -> importance 1–5 (trunk/motorway=5 …
+    residential=1) + lanes. A violation on a trunk blocks far more flow than on a side street.
+  • URBAN ACTIVITY (OSM 1 km): counts of HOSPITALS, OFFICES, schools/colleges, transit
+    (bus stops, railway stations), malls/markets, worship — how much parking demand the area
+    generates. Parking lots count NEGATIVELY (legitimate supply offsets demand).
+  • VEHICLE SEVERITY: dominant vehicle footprint (scooter=1 … bus=5, lorry/HGV=6).
+  • JUNCTION RISK: 1 if the zone sits at a real junction (blocks turns/sightlines).
+  • LIVE CONGESTION (TomTom, optional): 1 − current/free-flow speed at the centroid.
+Impact Score (0–100, weights sum to 1.0) = 100 x (0.30 enforcement + 0.18 road + 0.18 urban +
+0.14 congestion + 0.12 vehicle + 0.08 junction); with no key the congestion weight folds into
+the other five (-> 0.35/0.20/0.20/0.15/0.10).
+Each zone gets a plain-English "Why" reason (e.g. "Trunk road · near 15 hospitals · transit
+hub") — explainable ranking.
+
+WHY TOMTOM LIVE TRAFFIC IS KEPT ASIDE (an honest decision): TomTom returns CURRENT speeds,
+but our data is HISTORICAL — today's traffic did not cause a 2024 ticket, so live congestion
+can't be matched 1:1 to past violations. So the live layer is optional, fetched fresh (never
+cached), labelled "demo only", and folds out of the formula entirely with no key — the app
+runs fully on the keyless 5-component score. In a real-time deployment the same code path
+streams live and the score reacts instantly. Resilience: static OSM is cached permanently
+(deduped to an ~11 m grid); every external call
+degrades gracefully to neutral defaults/estimates, so tables and maps always render.
+
+OBJECTIVE 3 — PREDICTIVE FORECASTING ("TOMORROW'S HOTSPOTS")
+Descriptive layers say what happened; this layer is PROACTIVE.
+  • Honest target: an individual event's exact lat/long is irreducible noise (not learnable);
+    the EXPECTED zone-day intensity (violations per zone tomorrow) is — and is what enforcement
+    needs. We forecast that and rank zones.
+  • Day, not hour (data-driven): (zone x hour) averages <1 (too sparse); (zone x day) ~4.2 when
+    active — real signal. Built as a dense (zone x day) panel with structural zeros.
+  • Features: calendar + cyclical (weekday, day-of-year sin/cos, is_holiday), lag & rolling
+    history (lag_1/7/14, rolling mean 7/14/30, std, expanding mean) — every one shift(1)-ed to
+    GUARANTEE no leakage — plus zone-static context and optional OSM.
+  • Model: scikit-learn HistGradientBoostingRegressor(loss="poisson") — correct for
+    non-negative, zero-inflated counts; one GLOBAL model shares strength across zones, handles
+    mixed numeric+categorical + NaNs natively, trains in seconds (no new heavy dependency). Two
+    quantile models give a coherent q10–q90 band. Benchmarked vs a seasonal-naive baseline.
+  • Evaluation (30-day temporal holdout): BEATS the baseline on every metric — MAE 1.02 vs 1.11
+    (−8.4%), Poisson deviance 2.37 vs 3.93, Precision@10 0.23 vs 0.18, NDCG@10 0.41 vs 0.31,
+    Spearman 0.30 vs 0.21. Ranking metrics (which decide prioritisation) improve most.
+
+THE ACTION LAYER — FROM INSIGHT TO DEPLOYMENT
+  • COMMAND CENTER: "What now?" Priority cards per zone — severity (HIGH/MED/LOW), traffic-
+    impact + forecast-risk scores, a "Why this location?" factor list, recommended action, and
+    (after dispatch) nearest-unit ETA. Auto-follows current IST, with manual override.
+  • SMART BRIEFINGS: deterministic, offline, template-based natural-language shift summaries
+    (instant, reproducible); one-click "Generate All" -> downloadable dated briefing .txt.
+  • PATROL DISPATCH (ROUTE TRACKING): "Who goes where?" Computes a unit x hotspot travel-time
+    matrix (TomTom Matrix Routing v2), greedily assigns the nearest free unit to the top
+    hotspot, then pulls TomTom Calculate Route for the final pairs to draw the real traffic-aware
+    route polyline + ETA + distance. Every call degrades to a haversine estimate (~25 km/h,
+    dashed route), so dispatch always works; the UI flags live vs estimated.
+
+ENGINEERING & STACK: offline+cached compute; read-only queries cached across reruns; graceful
+degradation everywhere. Python · Streamlit · Folium · HDBSCAN · scikit-learn · pandas/numpy/
+scipy · SQLite · OSM Overpass (keyless) + TomTom (optional).
+
+FUTURE SCOPE
+  • AGENTIC AI ENFORCEMENT COPILOT: today's intelligence is classical ML (HDBSCAN + Poisson
+    GBM) with template briefings. Next: a GenAI agent (e.g. Claude) that writes richer
+    context-aware narratives, answers free-text questions over the data, and acts AGENTICALLY
+    — monitoring live forecast +
+    congestion feeds and autonomously proposing (with human approval) patrol re-assignments,
+    escalations and station alerts. ML keeps every recommendation grounded, explainable, auditable.
+  • AUTOMATED STATION DISPATCH: email each police station its zone briefing + assigned route.
+  • IN-HOTSPOT MICRO-TARGETING: use the individual violation lat/longs INSIDE a cluster (kernel-
+    density / sub-clustering) to pinpoint the exact kerb segment and an optimised path, not just
+    the centroid.
+  • Real-time TomTom streaming; repeat-offender radar; jurisdiction-aware labels; longer-horizon
+    forecasts.
+
+WHY IT WINS: real ~298K-record data; unsupervised, label-free detection re-derived per context so
+geography adapts; goes BEYOND a heatmap by quantifying congestion impact into one explainable
+priority; turns reactive reporting into proactive, forecast-led pre-positioning; fast and resilient
+— every external call degrades gracefully, so the dashboard never breaks.

@@ -1,4 +1,4 @@
-# ParkSense AI — Project Overview
+# NagaraNetra — Project Overview
 
 > **AI-Driven Parking Intelligence & Enforcement Dashboard**
 > Flipkart GridLock Hackathon · Round 2
@@ -18,7 +18,7 @@ their congestion impact, and it is hard to prioritise which zones to police.
 > hotspots and **quantify their impact on traffic flow** to enable **targeted
 > enforcement**?
 
-ParkSense AI answers this in two objectives:
+NagaraNetra answers this in two objectives:
 
 - **Objective 1 — Detect hotspots:** find *where* and *when* illegal parking
   clusters using unsupervised spatial clustering (HDBSCAN) over ~298K real

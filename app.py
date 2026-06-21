@@ -8,7 +8,7 @@ import pytz
 
 DB_PATH = "data/hotspots.db"
 
-st.set_page_config(page_title="ParkSense AI", layout="wide", page_icon="🚔")
+st.set_page_config(page_title="NagaraNetra", layout="wide", page_icon="🚔")
 
 # ── Light UI polish ────────────────────────────────────────────────────────────
 st.markdown("""
@@ -154,7 +154,7 @@ def zone(row):
 # Sidebar navigation — the left pane changes per view
 # ════════════════════════════════════════════════════════════════════════════════
 
-st.sidebar.markdown("## 🚔 ParkSense AI")
+st.sidebar.markdown("## 🚔 NagaraNetra")
 st.sidebar.caption("AI-Driven Parking Intelligence")
 
 NAV_ITEMS = [
@@ -194,7 +194,7 @@ with st.sidebar.expander("🔑 TomTom API key"):
     st.caption("✅ Key loaded from secrets.toml" if _has_secret
                else "⚠️ No key in secrets — routing falls back to estimates without one.")
 
-st.title("🚔 ParkSense AI")
+st.title("🚔 NagaraNetra")
 st.caption("AI-Driven Parking Intelligence & Enforcement Dashboard")
 
 

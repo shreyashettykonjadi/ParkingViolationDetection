@@ -286,7 +286,7 @@ def build_monthly_layer(df, conn):
 
 def main():
     print("=" * 55)
-    print("ParkSense AI — Hotspot Build Pipeline")
+    print("NagaraNetra — Hotspot Build Pipeline")
     print("=" * 55)
 
     # Load & prepare

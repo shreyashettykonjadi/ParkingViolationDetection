@@ -2,7 +2,7 @@
 
 ## Project
 
-**ParkSense AI – AI-Driven Parking Intelligence & Enforcement System**
+**NagaraNetra – AI-Driven Parking Intelligence & Enforcement System**
 
 ---
 
@@ -496,7 +496,7 @@ This enables city-wide spatial intelligence.
 
 # Project-Relevant Features
 
-The following columns are considered core for ParkSense AI:
+The following columns are considered core for NagaraNetra:
 
 ```text
 latitude

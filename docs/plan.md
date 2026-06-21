@@ -24,7 +24,7 @@ Just build a rock-solid foundation.
 Create structure:
 
 ```text
-parksense-ai/
+NagaraNetra-ai/
 
 data/
 │
@@ -521,7 +521,7 @@ Page title:
 
 ```python
 st.set_page_config(
-    page_title="ParkSense AI"
+    page_title="NagaraNetra"
 )
 ```
 
@@ -531,7 +531,7 @@ Heading:
 
 ```python
 st.title(
-    "ParkSense AI"
+    "NagaraNetra"
 )
 ```
 

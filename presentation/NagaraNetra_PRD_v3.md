@@ -1,5 +1,5 @@
 # PRODUCT REQUIREMENTS DOCUMENT
-## ParkSense AI
+## NagaraNetra
 ### Traffic Impact Intelligence & Enforcement Planning Platform
 
 **Operational Challenge**
@@ -27,7 +27,7 @@ Bengaluru Traffic Police currently address illegal and spillover parking reactiv
 - Which of the many hotspots should be prioritized first, given finite enforcement capacity
 - Which locations are likely to become problems in the next few hours or days, before violations accumulate
 
-ParkSense AI converts this historical violation log into actionable enforcement intelligence. It does this by combining a three-layer spatial hotspot detection system, road-network intelligence, urban context enrichment, live traffic conditions, a deterministic Traffic Impact Score, and a Live Enforcement page that recommends deployment locations in real time.
+NagaraNetra converts this historical violation log into actionable enforcement intelligence. It does this by combining a three-layer spatial hotspot detection system, road-network intelligence, urban context enrichment, live traffic conditions, a deterministic Traffic Impact Score, and a Live Enforcement page that recommends deployment locations in real time.
 
 **Core architectural insight:** Run all HDBSCAN clustering in a one-time offline build pipeline. Store results in SQLite. Streamlit reads pre-computed results — no clustering ever runs during a dashboard session.
 
@@ -35,7 +35,7 @@ ParkSense AI converts this historical violation log into actionable enforcement 
 
 ## 2. Product Vision
 
-Move Bengaluru Traffic Police from reactive enforcement to predictive enforcement intelligence. A traffic officer or command center supervisor opening the ParkSense dashboard should be able to answer five questions within seconds:
+Move Bengaluru Traffic Police from reactive enforcement to predictive enforcement intelligence. A traffic officer or command center supervisor opening the NagaraNetra dashboard should be able to answer five questions within seconds:
 
 1. **What is happening?** — where are the active parking hotspots right now
 2. **How severe is it?** — what is the quantified traffic impact of each hotspot
@@ -116,7 +116,7 @@ On-street illegal parking and spillover parking near metro stations, commercial 
 
 ### ⚠️ v3.0 Update — SQLite Pre-Computation Architecture
 
-ParkSense V1 uses a **build-once, query-always** architecture. All HDBSCAN clustering and hotspot analytics are computed offline in a single pipeline script (`build_hotspots.py`) and stored in a SQLite database (`data/hotspots.db`). The Streamlit dashboard reads from SQLite only — no clustering, no aggregation, and no external API calls happen during a dashboard session.
+NagaraNetra V1 uses a **build-once, query-always** architecture. All HDBSCAN clustering and hotspot analytics are computed offline in a single pipeline script (`build_hotspots.py`) and stored in a SQLite database (`data/hotspots.db`). The Streamlit dashboard reads from SQLite only — no clustering, no aggregation, and no external API calls happen during a dashboard session.
 
 ```
 Raw Violations CSV (298,450 rows)

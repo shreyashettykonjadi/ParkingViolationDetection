@@ -1,6 +1,6 @@
 # Scoring & Enrichment — Complete Reference
 
-How ParkSense AI assigns attributes to a hotspot, scores it for enforcement, and
+How NagaraNetra assigns attributes to a hotspot, scores it for enforcement, and
 re-ranks it by traffic impact. Every formula below is taken directly from the
 implementation (`build_hotspots.py`, `src/enrichment.py`, `app.py`).
 

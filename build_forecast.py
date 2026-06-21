@@ -90,7 +90,7 @@ def load_osm(static):
 
 def main():
     print("=" * 55)
-    print("ParkSense AI — Forecast Build Pipeline")
+    print("NagaraNetra — Forecast Build Pipeline")
     print("=" * 55)
 
     if not Path(HOTSPOTS_DB).exists():

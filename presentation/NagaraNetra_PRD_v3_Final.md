@@ -1,5 +1,5 @@
 # PRODUCT REQUIREMENTS DOCUMENT
-## ParkSense AI — Traffic Impact Intelligence & Enforcement Planning Platform
+## NagaraNetra — Traffic Impact Intelligence & Enforcement Planning Platform
 
 | Field | Value |
 |---|---|
@@ -24,9 +24,9 @@ Enforcement today is reactive: officers go where they already expect violations,
 
 ---
 
-## 2. What ParkSense AI Does
+## 2. What NagaraNetra Does
 
-ParkSense AI runs **17 independent HDBSCAN models** on the violation dataset — offline, once — and stores all results in a SQLite database. The Streamlit dashboard reads those pre-computed results in real time. No clustering, no aggregation, and no external API calls happen during a dashboard session.
+NagaraNetra runs **17 independent HDBSCAN models** on the violation dataset — offline, once — and stores all results in a SQLite database. The Streamlit dashboard reads those pre-computed results in real time. No clustering, no aggregation, and no external API calls happen during a dashboard session.
 
 The output is a ranked, filterable enforcement intelligence dashboard that answers four operational questions:
 

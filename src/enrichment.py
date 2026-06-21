@@ -20,7 +20,7 @@ import requests
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 TOMTOM_URL = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
 # Overpass rejects the default python-requests UA (HTTP 406); identify the app.
-HEADERS = {"User-Agent": "ParkSenseAI/1.0 (parking-enforcement-research)"}
+HEADERS = {"User-Agent": "NagaraNetra/1.0 (parking-enforcement-research)"}
 
 
 def _overpass(query, timeout):
