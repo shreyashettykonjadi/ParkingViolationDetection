@@ -271,3 +271,59 @@ def get_live_traffic(cell_keys):
         f"SELECT * FROM live_traffic WHERE cell_key IN ({placeholders})",
         tuple(cell_keys),
     )
+
+
+# ── Forecast store (Predictive layer) ─────────────────────────────────────────
+# Separate SQLite file written by build_forecast.py — survives build_hotspots.py
+# rebuilds, same as enrichment.db. Predictions join back to persistent_hotspots
+# (in hotspots.db) for centroid/station/junction in pandas, since the tables live
+# in different database files.
+
+from pathlib import Path as _Path
+
+FORECAST_DB_PATH = "data/forecast.db"
+
+
+def _forecast_conn():
+    conn = sqlite3.connect(FORECAST_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _forecast_query(sql, params=()):
+    with _forecast_conn() as conn:
+        return pd.read_sql(sql, conn, params=params)
+
+
+def forecast_available():
+    return _Path(FORECAST_DB_PATH).exists()
+
+
+def get_predictions(limit=20):
+    """Next-day predictions joined to persistent_hotspots for display."""
+    if not forecast_available():
+        return pd.DataFrame()
+    preds = _forecast_query(
+        "SELECT * FROM predictions ORDER BY pred_rank LIMIT ?", (int(limit),)
+    )
+    if len(preds) == 0:
+        return preds
+    ph = query(
+        "SELECT cluster_id, centroid_lat, centroid_long, police_station, "
+        "nearest_junction, top_violation, peak_hour, dominant_vehicle "
+        "FROM persistent_hotspots"
+    )
+    return preds.merge(ph, on="cluster_id", how="left")
+
+
+def get_forecast_metrics():
+    if not forecast_available():
+        return pd.DataFrame(columns=["metric", "model", "baseline"])
+    return _forecast_query("SELECT metric, model, baseline FROM forecast_metrics")
+
+
+def get_forecast_meta(key):
+    if not forecast_available():
+        return None
+    row = _forecast_query("SELECT value FROM forecast_meta WHERE key = ?", (key,))
+    return row.iloc[0, 0] if len(row) > 0 else None

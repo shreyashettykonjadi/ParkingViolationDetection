@@ -159,6 +159,7 @@ st.sidebar.caption("AI-Driven Parking Intelligence")
 
 NAV_ITEMS = [
     ("Command Center",      "🎯"),
+    ("Forecast",            "🔮"),
     ("Briefings",           "📝"),
     ("Patrol Dispatch",     "🚓"),
     ("Live Enforcement",    "🟠"),
@@ -1003,10 +1004,116 @@ def _render_dispatch_map(result, sel_route):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# VIEW — Forecast (Predictive layer: tomorrow's predicted hotspots)
+# ════════════════════════════════════════════════════════════════════════════════
+
+def render_forecast():
+    st.sidebar.subheader("Forecast")
+    st.sidebar.caption("Next-day predicted violations per zone, ranked by a trained "
+                       "Poisson model. No filters — shows tomorrow's top zones.")
+
+    st.header("🔮 Forecast — Tomorrow's Predicted Hotspots")
+
+    if not db.forecast_available():
+        st.warning("No forecast yet. Run `python build_forecast.py` to train the model "
+                   "and generate next-day predictions.")
+        return
+
+    target_date  = db.get_forecast_meta("target_date")
+    target_wd    = db.get_forecast_meta("target_weekday")
+    improvement  = db.get_forecast_meta("mae_improvement_pct")
+    data_max     = db.get_forecast_meta("data_max_date")
+
+    st.caption(
+        f"Predicting **{target_wd}, {target_date}** — the day after the dataset ends "
+        f"({data_max}). We forecast the **expected violation count per zone** (a "
+        "spatio-temporal intensity) and rank zones, so patrols can be pre-positioned. "
+        "An individual violation's exact location is not predictable; zone-level "
+        "demand is."
+    )
+
+    preds = db.get_predictions(limit=20)
+    if len(preds) == 0:
+        st.info("Forecast database is empty. Re-run `python build_forecast.py`.")
+        return
+
+    metrics = db.get_forecast_metrics()
+    mm = metrics.set_index("metric") if len(metrics) else None
+
+    # ── Headline metrics: ML vs baseline ──
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Forecast Day", f"{target_wd}", help=str(target_date))
+    if mm is not None and "MAE" in mm.index:
+        c2.metric("Model MAE", f"{mm.loc['MAE','model']:.2f}",
+                  delta=f"{float(improvement):+.0f}% vs baseline", delta_color="inverse")
+        c3.metric("Baseline MAE", f"{mm.loc['MAE','baseline']:.2f}")
+        c4.metric("Ranking Precision@10", f"{mm.loc['precision@10','model']:.0%}",
+                  delta=f"{(mm.loc['precision@10','model']-mm.loc['precision@10','baseline']):+.0%}")
+    st.caption("Metrics measured on a 30-day temporal holdout (train on history before "
+               "it, test on the unseen last 30 days). Lower MAE / higher Precision@10 is better.")
+
+    # ── Map ──
+    st.subheader("🗺️ Predicted Hotspot Map")
+    st.caption("🟢 Sized by predicted violations for the forecast day · top 20 zones")
+    plot = preds.dropna(subset=["centroid_lat", "centroid_long"]).copy()
+    mx = max(float(plot["pred_count"].max()), 1.0)
+    plot["size_scaled"] = plot["pred_count"] / mx * 1100   # /40 in make_cluster_map → ≤~28
+
+    def popup(row):
+        return (
+            f"<b>🔮 #{int(row['pred_rank'])} — {zone(row)}</b><br>"
+            f"Predicted: <b>{row['pred_count']:.1f}</b> violations "
+            f"({target_wd})<br>"
+            f"Confidence band: {row['q10']:.1f} – {row['q90']:.1f}<br>"
+            f"Recent 7-day avg: {row['recent_7d_mean']:.1f}/day<br>"
+            f"Seasonal baseline: {row['base_count']:.1f}<br>"
+            f"Top violation: {row['top_violation']}"
+        )
+
+    render_map(make_cluster_map(plot, "size_scaled", "#0d9488", popup), "forecast")
+
+    # ── Ranked table ──
+    st.subheader("📋 Predicted Priority Queue")
+    show = preds.copy()
+    show["Band"] = show.apply(lambda r: f"{r['q10']:.0f}–{r['q90']:.0f}", axis=1)
+    show["Δ vs baseline"] = (show["pred_count"] - show["base_count"]).round(1)
+    disp = show[[
+        "pred_rank", "police_station", "nearest_junction", "pred_count", "Band",
+        "recent_7d_mean", "base_count", "Δ vs baseline", "top_violation",
+    ]].copy()
+    disp.columns = ["Rank", "Police Station", "Junction", "Predicted", "Band (q10–q90)",
+                    "Recent 7d/day", "Baseline", "Δ vs baseline", "Top Violation"]
+    disp["Predicted"]     = disp["Predicted"].round(1)
+    disp["Recent 7d/day"] = disp["Recent 7d/day"].round(1)
+    disp["Baseline"]      = disp["Baseline"].round(1)
+    st.dataframe(disp, width="stretch", hide_index=True)
+
+    # ── Per-zone history + prediction ──
+    st.subheader("📈 Zone History & Prediction")
+    labels = {f"#{int(r['pred_rank'])} — {zone(r)}": int(r["cluster_id"])
+              for _, r in preds.iterrows()}
+    sel = st.selectbox("Zone", list(labels.keys()))
+    cid = labels[sel]
+    hist = db.query(
+        "SELECT date, COUNT(*) AS count FROM violations "
+        "WHERE persistent_cluster_id = ? GROUP BY date ORDER BY date", (cid,)
+    )
+    if len(hist):
+        hist = hist.set_index("date")["count"]
+        prow = preds[preds["cluster_id"] == cid].iloc[0]
+        hist.loc[str(target_date)] = prow["pred_count"]   # append the forecast point
+        st.line_chart(hist)
+        st.caption(f"Daily actual violations for this zone; the final point "
+                   f"({target_date}) is the model's prediction "
+                   f"(~{prow['pred_count']:.1f}, band {prow['q10']:.1f}–{prow['q90']:.1f}).")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Router
 # ════════════════════════════════════════════════════════════════════════════════
 
 if   view == "Command Center":      render_command_center()
+elif view == "Forecast":            render_forecast()
 elif view == "Briefings":           render_briefings()
 elif view == "Patrol Dispatch":     render_patrol_dispatch()
 elif view == "Violation Explorer":  render_violation_explorer()

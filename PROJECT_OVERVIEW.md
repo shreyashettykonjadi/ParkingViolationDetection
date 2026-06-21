@@ -27,6 +27,10 @@ ParkSense AI answers this in two objectives:
   they actually hurt traffic flow, fusing OpenStreetMap road/urban context with
   optional **live TomTom congestion**, so enforcement effort goes where it
   relieves the most congestion.
+- **Objective 3 — Predict (proactive, not reactive):** forecast **tomorrow's**
+  expected violations per zone with a trained Poisson model, so patrols are
+  **pre-positioned** instead of dispatched after the fact — directly attacking the
+  problem's "patrol-based and reactive" pain point.
 
 ---
 
@@ -41,6 +45,11 @@ database of hotspots:
 | **Persistent Hotspots** | All-time geographic hotspots over the full dataset (Nov 2023 – Apr 2024) | 🔴 red clusters |
 | **Monthly Hotspots** | Hotspots recomputed per calendar month (6 months) | 🟣 purple clusters |
 | **Live Enforcement** | Context-aware enforcement priority queue (day-type × time-bucket), auto-following current IST; plus **Traffic Impact Re-Ranking** | 🟠 orange (priority) → 🟢 green (impact) |
+| **🔮 Forecast** | **Tomorrow's predicted hotspots** — next-day expected violations per zone, ranked, with confidence bands (see §8) | 🟢 teal clusters |
+
+> The deployed app also exposes action views built on these layers — **Command
+> Center** (priority cards), **Briefings** (plain-English shift summaries), and
+> **Patrol Dispatch** (TomTom-routed unit assignment).
 
 ---
 
@@ -86,6 +95,8 @@ public APIs.
 | `src/hotspot_detection.py` | `run_hdbscan()` — HDBSCAN with **haversine** metric on lat/long radians |
 | `src/db.py` (205 LOC) | Read-only SQLite query layer + label constants (`MONTH_LABELS`, `SHIFT_DISPLAY`) |
 | `src/enrichment.py` (352 LOC) | OSM (Overpass) road + urban context, TomTom live traffic, and the impact scoring formula |
+| `src/forecast.py` | Predictive layer (Obj 3): panel builder, feature engineering, baseline + Poisson GBM, evaluation, next-day prediction |
+| `build_forecast.py` | Offline forecast pipeline → `data/forecast.db` (train → evaluate → predict → persist) |
 | `src/data_prep.py` | (currently empty placeholder) |
 | `data/clean_parking_data.csv` | Cleaned input — 298,450 records |
 | `data/parking_data.csv` | Raw input |
@@ -167,7 +178,40 @@ neutral defaults so the table always renders.
 
 ---
 
-## 8. Database Schema (`data/hotspots.db`)
+## 8. Predictive Forecasting — "Tomorrow's Predicted Hotspots" (Objective 3)
+
+The hotspot layers are **descriptive** (what already happened). The forecasting
+layer is **predictive**: for every zone it forecasts the **expected violation
+count on the next day** and ranks zones, so patrols can be pre-positioned.
+
+> **Honest framing:** an individual event's exact lat/long is irreducibly noisy
+> and not learnable. The **expected zone-day intensity** is — and is exactly what
+> enforcement needs. *Full details & math in [`presentation/FORECASTING_MODEL.md`](presentation/FORECASTING_MODEL.md).*
+
+- **Granularity — day, not hour:** profiling showed hourly-per-zone averages <1
+  violation (too sparse); **day-level** has real signal (~4.2/active cell), so a
+  daily **count** model is the right target.
+- **Data prep:** a project-wide **UTC → IST** timezone fix in `build_hotspots.py`
+  (the raw `hour` was UTC); then a dense **(zone × day)** panel with structural
+  zeros (`src/forecast.build_panel`).
+- **Features:** calendar/cyclical (`weekday`, `is_holiday`, day-of-year sin/cos…),
+  **lag & rolling** history (`lag_1/7/14`, rolling mean 7/14/30 — all `shift(1)`-ed
+  to prevent leakage), zone-static context, and optional cached OSM.
+- **Model:** `sklearn HistGradientBoostingRegressor(loss="poisson")` (correct for
+  zero-inflated counts; handles NaNs + categoricals natively) **+** quantile models
+  for a coherent confidence band. Benchmarked against a **seasonal-naive baseline**.
+- **Evaluation (30-day temporal holdout):** the model **beats the baseline on every
+  metric** — MAE 1.02 vs 1.11 (−8.4%), Poisson deviance 2.37 vs 3.93, Precision@10
+  0.23 vs 0.18, NDCG@10 0.41 vs 0.31, Spearman 0.30 vs 0.21.
+- **Output:** persisted to a **separate `data/forecast.db`** (survives hotspot
+  rebuilds, like `enrichment.db`).
+
+Built offline by **`build_forecast.py`** (`python build_forecast.py`); read by the
+🔮 Forecast tab via `db.get_predictions` / `get_forecast_metrics`.
+
+---
+
+## 9. Database Schema (`data/hotspots.db`)
 
 | Table | Contents |
 |-------|----------|
@@ -176,18 +220,22 @@ neutral defaults so the table always renders.
 | `contextual_hotspots` | Layer 2, keyed by `(context, cluster_id)` + `enforcement_score`, `recent_count` |
 | `monthly_hotspots` | Layer 3, keyed by `(year_month, cluster_id)` |
 | `hotspot_metadata` | Date range, contexts, last-30d cutoff, totals |
-| `hotspot_enrichment` | OSM cache (created on demand by the app) |
+| `hotspot_enrichment` | OSM cache — lives in a **separate `data/enrichment.db`** so it survives rebuilds |
 
 Indexed for fast filtering by station/hour/date, context+rank, and year_month+rank.
+
+**Side databases (survive `build_hotspots.py` rebuilds):**
+- `data/enrichment.db` — `hotspot_enrichment` (OSM cache) + `live_traffic` (TomTom snapshots).
+- `data/forecast.db` — `predictions`, `forecast_metrics`, `forecast_meta` (Objective 3).
 
 ---
 
 ## 9. Tech Stack
 
 - **Python** · **Streamlit** (UI) · **streamlit-folium** + **Folium** (maps)
-- **HDBSCAN** (clustering) · **pandas** / **numpy**
-- **SQLite** (precomputed store) · **requests** (Overpass + TomTom)
-- **APIs:** OpenStreetMap **Overpass** (keyless), **TomTom** Traffic (optional key)
+- **HDBSCAN** (clustering) · **scikit-learn** (Poisson GBM forecasting) · **pandas** / **numpy** / **scipy**
+- **SQLite** (precomputed stores) · **requests** (Overpass + TomTom)
+- **APIs:** OpenStreetMap **Overpass** (keyless), **TomTom** Traffic + Routing (optional key)
 
 ---
 
@@ -200,15 +248,19 @@ pip install -r requirements.txt
 # 2. Build the hotspot database (offline, re-runnable)
 python build_hotspots.py
 
-# 3. Launch the dashboard
+# 3. Train the forecast model + generate next-day predictions (Objective 3)
+python build_forecast.py
+
+# 4. Launch the dashboard
 streamlit run app.py
 ```
 
-- **TomTom live congestion is optional** — set `TOMTOM_API_KEY` in
+- **TomTom live congestion/routing is optional** — set `TOMTOM_API_KEY` in
   `.streamlit/secrets.toml`. Without it, the impact score uses the 5-component
-  formula and the app runs fully on free/keyless data.
-- The app halts with a friendly error if `data/hotspots.db` is missing — run
-  step 2 first.
+  formula and dispatch falls back to haversine estimates; the app runs fully on
+  free/keyless data.
+- Each tab halts with a friendly notice if its database is missing — the Forecast
+  tab prompts you to run `build_forecast.py`, the rest need `build_hotspots.py`.
 
 ---
 
@@ -220,6 +272,8 @@ streamlit run app.py
 - **Beyond a heatmap:** directly addresses the problem's hard part — *quantifying
   congestion impact* — by fusing violations + road criticality + urban demand +
   live traffic into a single, explainable enforcement priority.
+- **Reactive → proactive:** a leakage-safe Poisson forecast that **out-ranks a
+  strong baseline** turns yesterday's report into tomorrow's patrol plan.
 - **Operationally usable:** the Live Enforcement queue auto-follows the current
   IST day/time, giving patrol teams a ranked, context-aware target list right now.
 - **Fast & resilient:** heavy compute is offline & cached; every external call

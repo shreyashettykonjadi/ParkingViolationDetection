@@ -293,7 +293,18 @@ def main():
     # Load & prepare
     print("\n[0/4] Loading and preparing data...")
     df = pd.read_csv(CSV_PATH)
-    df["date"]       = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+
+    # The CSV's hour/weekday/date columns are derived from created_datetime in UTC.
+    # Bengaluru is UTC+5:30, so we re-derive every temporal field in IST — otherwise
+    # the time buckets (and the app's "current IST -> bucket" logic) are misaligned by
+    # 5.5h. Note a late-UTC event can roll over to the next IST date.
+    ist = (pd.to_datetime(df["created_datetime"], utc=True, format="ISO8601")
+             .dt.tz_convert("Asia/Kolkata"))
+    df["hour"]    = ist.dt.hour
+    df["weekday"] = ist.dt.weekday
+    df["month"]   = ist.dt.month
+    df["date"]    = ist.dt.strftime("%Y-%m-%d")
+
     df["year_month"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m")
     df["time_bucket"] = _assign_shift(df["hour"])
     df["day_type"]    = _assign_day_type(df["weekday"])
