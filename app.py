@@ -685,13 +685,6 @@ def render_command_center():
     k3.metric("Top Impact", f"{hotspots[0]['traffic_impact']} / 100")
     k4.metric("Units Dispatched", len(dispatch_res["assignments"]) if dispatch_res else 0)
 
-    if not enriched:
-        st.info("ℹ️ Cards show violation-based priority. Click **⚡ Enrich (OSM + "
-                "TomTom)** in the sidebar to add road type, hospital/office counts "
-                "and live congestion.")
-    if not dispatch_res:
-        st.info("ℹ️ Nearest-unit ETAs appear here once you run **Patrol Dispatch**.")
-
     st.divider()
     for h in hotspots:
         _render_priority_card(h, eta_by_cluster.get(h["cluster_id"]))
