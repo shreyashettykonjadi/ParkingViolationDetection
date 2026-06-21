@@ -168,7 +168,6 @@ def build_persistent_layer(df, conn):
     print("\n[Layer 1] Persistent Hotspots — full dataset")
     labels = run_hdbscan(df, min_cluster_size=PERSISTENT_MIN_CLUSTER)
     df["persistent_cluster_id"] = labels
-    n_clusters = int((labels >= 0).sum() > 0 and pd.Series(labels[labels >= 0]).nunique())
     noise_pct  = (labels == -1).mean() * 100
     print(f"  Clusters: {pd.Series(labels[labels>=0]).nunique():,}  |  Noise: {noise_pct:.1f}%")
 

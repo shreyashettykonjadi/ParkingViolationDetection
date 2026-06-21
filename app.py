@@ -140,7 +140,7 @@ def render_map(m, base_key, height=550):
                  help="Re-center the map on the clusters"):
         st.session_state[nkey] += 1
     st_folium(
-        m, width=1200, height=height,
+        m, use_container_width=True, height=height,
         key=f"{base_key}_{st.session_state[nkey]}",
         returned_objects=[],
     )
@@ -538,7 +538,11 @@ def _render_traffic_impact(rows, context):
             f"Why: {row['reason']}"
         )
 
-    render_map(make_cluster_map(imp, "importance", "#2ca02c", popup), "impact")
+    # Impact score is 0–100; make_cluster_map divides size_col by 40, so scale it up
+    # the same way the Forecast tab does — otherwise every bubble clamps to min radius.
+    imp_plot = imp.copy()
+    imp_plot["impact_size"] = imp_plot["importance"] / 100 * 1100
+    render_map(make_cluster_map(imp_plot, "impact_size", "#2ca02c", popup), "impact")
 
     def arrow(c):
         return f"▲ {c}" if c > 0 else (f"▼ {abs(c)}" if c < 0 else "—")
@@ -999,8 +1003,8 @@ def _render_dispatch_map(result, sel_route):
     if all_pts:
         lats = [p[0] for p in all_pts]; lons = [p[1] for p in all_pts]
         m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(40, 40))
-    st_folium(m, width=1200, height=560, key=f"dispatch_map_{result['context']}",
-              returned_objects=[])
+    st_folium(m, use_container_width=True, height=560,
+              key=f"dispatch_map_{result['context']}", returned_objects=[])
 
 
 # ════════════════════════════════════════════════════════════════════════════════

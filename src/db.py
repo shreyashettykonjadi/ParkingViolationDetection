@@ -1,5 +1,6 @@
 import sqlite3
 import pandas as pd
+import streamlit as st
 
 DB_PATH = "data/hotspots.db"
 
@@ -24,7 +25,11 @@ def _conn():
     return conn
 
 
+@st.cache_data(show_spinner=False)
 def query(sql, params=()):
+    # hotspots.db is a precomputed, read-only artifact, so results are cached across
+    # Streamlit reruns (every widget interaction) instead of re-hitting SQLite each time.
+    # cache_data returns a copy per call, so callers can mutate freely.
     with _conn() as conn:
         return pd.read_sql(sql, conn, params=params)
 

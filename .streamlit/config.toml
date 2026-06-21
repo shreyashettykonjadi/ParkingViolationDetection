@@ -1,0 +1,6 @@
+# Pin a light base theme so the custom light metric/priority cards and the
+# dark-styled sidebar render consistently regardless of the viewer's OS/browser
+# dark-mode preference. (Committed; secrets.toml stays git-ignored.)
+[theme]
+base = "light"
+primaryColor = "#ff4b4b"

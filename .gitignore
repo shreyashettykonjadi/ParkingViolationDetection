@@ -12,8 +12,9 @@ data/*.csv
 # Personal notes
 docs/curr.md
 
-# Streamlit
-.streamlit/
+# Streamlit (ignore secrets, but keep the committed theme config)
+.streamlit/*
+!.streamlit/config.toml
 
 # VS Code
 .vscode/
